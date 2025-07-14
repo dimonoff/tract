@@ -4,9 +4,9 @@ use crate::internal::*;
 use crate::ops::element_wise::ElementWiseOp;
 use crate::ops::math::QScale;
 use num_traits::AsPrimitive;
+use tract_linalg::Scaler;
 use tract_linalg::lut::Lut;
 use tract_linalg::mmm::RoundingPolicy;
-use tract_linalg::Scaler;
 
 use super::binary::TypedBinOp;
 use super::math::round_ties_to_even;
@@ -246,6 +246,133 @@ impl TypedOp for DequantizeLinearF32 {
             }
         }
         Ok(None)
+    }
+
+    as_op!();
+}
+
+#[derive(Clone, Debug, new)]
+pub struct DequantizeLinearPerChannelF32 {
+    pub scale: Arc<Tensor>,
+    pub zero_point: Arc<Tensor>,
+}
+
+impl DequantizeLinearPerChannelF32 {
+    fn eval_t<T: Datum + AsPrimitive<i32>>(&self, input: &Tensor) -> TractResult<Tensor> {
+        let mut output = unsafe { Tensor::uninitialized::<f32>(input.shape())? };
+        let input_shape = input.shape();
+        let scale_data = self.scale.as_slice::<f32>()?;
+
+        // Per-channel quantization is typically along the first dimension (output channels)
+        let _num_channels = scale_data.len();
+        let input_data = input.as_slice::<T>()?;
+        let output_data = output.as_slice_mut::<f32>()?;
+
+        // For tensors with shape [C] or [C, ...], quantization is per channel along first dimension
+        let elements_per_channel = if input_shape.len() == 1 {
+            // 1D tensor: each element has its own scale/zero_point
+            1
+        } else {
+            // Multi-dimensional tensor: elements grouped by first dimension (output channels)
+            input.len() / input_shape[0]
+        };
+
+        if self.zero_point.datum_type() == u8::datum_type() {
+            let zero_point_data = self.zero_point.as_slice::<u8>()?;
+            for (idx, (&x, y)) in input_data.iter().zip(output_data.iter_mut()).enumerate() {
+                let channel_idx = if input_shape.len() == 1 {
+                    idx // 1D: direct index
+                } else {
+                    idx / elements_per_channel // Multi-D: index by first dimension
+                };
+                *y = (x.as_() - zero_point_data[channel_idx] as i32) as f32
+                    * scale_data[channel_idx];
+            }
+        } else if self.zero_point.datum_type() == i8::datum_type() {
+            let zero_point_data = self.zero_point.as_slice::<i8>()?;
+            for (idx, (&x, y)) in input_data.iter().zip(output_data.iter_mut()).enumerate() {
+                let channel_idx = if input_shape.len() == 1 {
+                    idx // 1D: direct index
+                } else {
+                    idx / elements_per_channel // Multi-D: index by first dimension
+                };
+                *y = (x.as_() - zero_point_data[channel_idx] as i32) as f32
+                    * scale_data[channel_idx];
+            }
+        } else {
+            let zero_point_data = self.zero_point.as_slice::<i32>()?;
+            for (idx, (&x, y)) in input_data.iter().zip(output_data.iter_mut()).enumerate() {
+                let channel_idx = if input_shape.len() == 1 {
+                    idx // 1D: direct index
+                } else {
+                    idx / elements_per_channel // Multi-D: index by first dimension
+                };
+                *y = (x.as_() - zero_point_data[channel_idx]) as f32 * scale_data[channel_idx];
+            }
+        }
+
+        Ok(output)
+    }
+}
+
+impl Op for DequantizeLinearPerChannelF32 {
+    fn name(&self) -> StaticName {
+        "DequantizeLinearPerChannelF32".into()
+    }
+
+    fn info(&self) -> TractResult<Vec<String>> {
+        Ok(vec![format!(
+            "scale: {:?} zero_point: {:?}",
+            self.scale.shape(),
+            self.zero_point.shape()
+        )])
+    }
+
+    fn validation(&self) -> Validation {
+        Validation::Accurate
+    }
+
+    op_as_typed_op!();
+}
+
+impl EvalOp for DequantizeLinearPerChannelF32 {
+    fn is_stateless(&self) -> bool {
+        true
+    }
+    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+        let output = match inputs[0].datum_type() {
+            DatumType::I8 => self.eval_t::<i8>(&inputs[0])?,
+            DatumType::I32 => self.eval_t::<i32>(&inputs[0])?,
+            DatumType::U8 => self.eval_t::<u8>(&inputs[0])?,
+            dt => bail!("Unsupported type {:?}", dt),
+        };
+        Ok(tvec!(output.into_tvalue()))
+    }
+}
+
+impl TypedOp for DequantizeLinearPerChannelF32 {
+    fn output_facts(&self, inputs: &[&TypedFact]) -> TractResult<TVec<TypedFact>> {
+        let mut fact = inputs[0].clone();
+        fact.datum_type = f32::datum_type();
+        Ok(tvec!(fact))
+    }
+
+    fn axes_mapping(
+        &self,
+        inputs: &[&TypedFact],
+        outputs: &[&TypedFact],
+    ) -> TractResult<AxesMapping> {
+        AxesMapping::natural(inputs, outputs)
+    }
+
+    fn change_axes(
+        &self,
+        model: &TypedModel,
+        node: &TypedNode,
+        _io: InOut,
+        change: &AxisOp,
+    ) -> TractResult<Option<AxisChangeConsequence>> {
+        Ok(Some(AxisChangeConsequence::new(model, node, None, change)))
     }
 
     as_op!();

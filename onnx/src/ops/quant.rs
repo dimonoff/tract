@@ -1,5 +1,6 @@
 use crate::model::{OnnxOpRegister, ParsingContext};
 use crate::pb::NodeProto;
+use tract_core::ops::quant::DequantizeLinearPerChannelF32;
 use tract_hir::internal::*;
 use tract_hir::ops::quant::*;
 use tract_ndarray::ArrayViewD;
@@ -38,8 +39,6 @@ fn dynamic_quantize_linear(
 pub struct QuantizeLinear {
     optional_zero_point_input: Option<usize>,
 }
-
-
 
 impl Expansion for QuantizeLinear {
     fn name(&self) -> StaticName {
@@ -104,8 +103,6 @@ pub struct DequantizeLinear {
     optional_zero_point_input: Option<usize>,
 }
 
-
-
 impl Expansion for DequantizeLinear {
     fn name(&self) -> StaticName {
         "DequantizeLinear".into()
@@ -136,13 +133,11 @@ impl Expansion for DequantizeLinear {
         target: &mut TypedModel,
         inputs: &[OutletId],
     ) -> TractResult<TVec<OutletId>> {
-        let scale = target
-            .outlet_fact(inputs[1])?
-            .konst
-            .as_ref()
-            .context("y_scale must be a const")?
-            .as_slice::<f32>()?[0];
-        let zero_point = if self.optional_zero_point_input.is_some() {
+        let scale_tensor =
+            target.outlet_fact(inputs[1])?.konst.as_ref().context("y_scale must be a const")?;
+        let scale_slice = scale_tensor.as_slice::<f32>()?;
+
+        let zero_point_tensor = if self.optional_zero_point_input.is_some() {
             target
                 .outlet_fact(inputs[2])?
                 .konst
@@ -152,21 +147,38 @@ impl Expansion for DequantizeLinear {
         } else {
             rctensor0(0u8)
         };
-        let op: Box<dyn TypedOp> = if zero_point.datum_type() == u8::datum_type() {
-            Box::new(DequantizeLinearF32::new(scale, zero_point.as_slice::<u8>()?[0] as i32))
-        } else if zero_point.datum_type() == i8::datum_type() {
-            Box::new(DequantizeLinearF32::new(scale, zero_point.as_slice::<i8>()?[0] as i32))
+
+        // Check if this is per-channel quantization (non-scalar scale/zero_point)
+        if scale_slice.len() > 1 {
+            // Per-channel quantization - create specialized operation
+            let op: Box<dyn TypedOp> = Box::new(DequantizeLinearPerChannelF32::new(
+                scale_tensor.clone(),
+                zero_point_tensor.clone(),
+            ));
+            target.wire_node(prefix, op, &[inputs[0]])
         } else {
-            Box::new(DequantizeLinearF32::new(scale, zero_point.as_slice::<i32>()?[0]))
-        };
-        target.wire_node(prefix, op, &[inputs[0]])
+            // Scalar quantization - use existing operation
+            let scale = scale_slice[0];
+            let op: Box<dyn TypedOp> = if zero_point_tensor.datum_type() == u8::datum_type() {
+                Box::new(DequantizeLinearF32::new(
+                    scale,
+                    zero_point_tensor.as_slice::<u8>()?[0] as i32,
+                ))
+            } else if zero_point_tensor.datum_type() == i8::datum_type() {
+                Box::new(DequantizeLinearF32::new(
+                    scale,
+                    zero_point_tensor.as_slice::<i8>()?[0] as i32,
+                ))
+            } else {
+                Box::new(DequantizeLinearF32::new(scale, zero_point_tensor.as_slice::<i32>()?[0]))
+            };
+            target.wire_node(prefix, op, &[inputs[0]])
+        }
     }
 }
 
 #[derive(Debug, Clone, new, Default, Hash)]
 pub struct DynamicQuantizeLinear {}
-
-
 
 impl Expansion for DynamicQuantizeLinear {
     fn name(&self) -> StaticName {
@@ -208,8 +220,7 @@ impl Expansion for DynamicQuantizeLinear {
 }
 
 fn dynamic_quantize_linear_f32_u8(x: f32, scale: f32, zero_point: u8) -> u8 {
-    (((x / scale).round() as i32) + zero_point as i32)
-        .clamp(u8::MIN as i32, u8::MAX as i32) as u8
+    (((x / scale).round() as i32) + zero_point as i32).clamp(u8::MIN as i32, u8::MAX as i32) as u8
 }
 
 fn dynamic_quantize_linear_u8(scale: f32, zero_point: u8, xs: &[f32], ys: &mut [u8]) {
@@ -266,8 +277,6 @@ impl Op for DynamicQuantizeLinearU8 {
 
     op_as_typed_op!();
 }
-
-
 
 impl EvalOp for DynamicQuantizeLinearU8 {
     fn is_stateless(&self) -> bool {
