@@ -1,5 +1,6 @@
 use log::*;
 use prost::Message;
+use regex::Regex;
 use std::path::PathBuf;
 use tract_hir::internal::*;
 use tract_onnx::data_resolver::FopenDataResolver;
@@ -126,6 +127,24 @@ fn versions() -> Vec<(&'static str, usize)> {
     if cfg!(feature = "onnx_1_13_0") {
         versions.push(("1.13.0", 18));
     }
+    if cfg!(feature = "onnx_1_14_1") {
+        versions.push(("1.14.1", 19));
+    }
+    if cfg!(feature = "onnx_1_15_0") {
+        versions.push(("1.15.0", 20));
+    }
+    if cfg!(feature = "onnx_1_16_2") {
+        versions.push(("1.16.2", 21));
+    }
+    if cfg!(feature = "onnx_1_17_0") {
+        versions.push(("1.17.0", 22));
+    }
+    if cfg!(feature = "onnx_1_18_0") {
+        versions.push(("1.18.0", 23));
+    }
+    if cfg!(feature = "onnx_1_19_1") {
+        versions.push(("1.19.1", 24));
+    }
     versions
 }
 
@@ -177,13 +196,15 @@ fn full() -> TestSuite {
         ("pytorch-operator", MANIFEST_PYTORCH_OPERATOR),
         ("pytorch-converted", MANIFEST_PYTORCH_CONVERTED),
     ] {
-        let working_list: Vec<(String, Vec<String>)> = manifest
+        let working_list: Vec<(Regex, Vec<String>)> = manifest
             .split('\n')
             .map(|s| s.to_string())
             .filter(|s| s.trim().len() > 1 && s.trim().as_bytes()[0] != b'#')
             .map(|s| {
                 let mut splits = s.split_whitespace();
-                (splits.next().unwrap().to_string(), splits.map(|s| s.to_string()).collect())
+                let pat = splits.next().unwrap();
+                let re = Regex::new(&format!("^{pat}$")).unwrap();
+                (re, splits.map(|s| s.to_string()).collect())
             })
             .collect();
 
@@ -203,7 +224,8 @@ fn full() -> TestSuite {
                 .collect();
             let mut units = TestSuite::default();
             for t in &tests {
-                let details = working_list.iter().find(|pair| &pair.0 == t).map(|pair| &*pair.1);
+                let details =
+                    working_list.iter().find(|pair| pair.0.is_match(t)).map(|pair| &*pair.1);
                 let ignored = details.is_none()
                     || details.unwrap().iter().any(|s| {
                         s.strip_prefix("since:")

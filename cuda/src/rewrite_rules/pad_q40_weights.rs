@@ -7,15 +7,15 @@ use tract_gpu::tensor::{DeviceTensor, DeviceTensorExt, IntoDevice, OwnedDeviceTe
 use tract_gpu::utils::as_q40_tensor;
 
 use crate::Q40_ROW_PADDING;
-use crate::kernels::matmul::GgmlGemm;
-use crate::ops::{CudaAxisOp, CudaFusedAxisOp, CudaGemm};
+use crate::ops::{CudaAxisOp, CudaFusedAxisOp, CudaGgmlGemm};
 use crate::tensor::CudaTensor;
 use crate::utils::pad_q40;
 
 fn is_mm_weights(model: &TypedModel, node: &TypedNode) -> TractResult<bool> {
     let mut cursor = node;
     while let Some(succ) = model.single_succ(cursor.id)? {
-        if succ.op_is::<CudaGemm<GgmlGemm>>() || succ.op_is::<CudaFusedAxisOp<CudaGemm<GgmlGemm>>>()
+        if succ.op_is::<CudaGgmlGemm>()
+            || (succ.op_as::<CudaFusedAxisOp>().is_some_and(|fao| fao.op.is::<CudaGgmlGemm>()))
         {
             return Ok(true);
         }
@@ -53,11 +53,10 @@ pub fn pad_q40_weights(
         return Ok(None);
     };
 
-    rule_ensure!(
-        cuda_tensor
-            .block_quant_fact()
+    rule_ensure!(cuda_tensor.opaque_fact().is_some_and(|of| {
+        of.downcast_ref::<BlockQuantFact>()
             .is_some_and(|bqf| bqf.format.same_as(&Q4_0) && bqf.k() % Q40_ROW_PADDING != 0)
-    );
+    }));
 
     let host_tensor = dev_tensor.to_host()?.into_tensor();
     let q40_view = as_q40_tensor(&host_tensor).expect("expected Q4_0 tensor view");

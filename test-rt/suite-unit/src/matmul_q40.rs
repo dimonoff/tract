@@ -37,8 +37,8 @@ impl Arbitrary for MatmulQ40Problem {
     fn arbitrary_with(params: Self::Parameters) -> Self::Strategy {
         (1..10usize, 1..128usize, 1..10usize)
             .prop_flat_map(|(m, k, n)| {
-                let a = tensor(&[m, k]);
-                let b = tensor(&[n, k]);
+                let a = mm_q40_tensor(&[m, k]);
+                let b = mm_q40_tensor(&[n, k]);
 
                 (a, b)
             })
@@ -47,7 +47,7 @@ impl Arbitrary for MatmulQ40Problem {
     }
 }
 
-pub fn tensor(shape: &[usize]) -> BoxedStrategy<Tensor> {
+fn mm_q40_tensor(shape: &[usize]) -> BoxedStrategy<Tensor> {
     let len = shape.iter().product::<usize>();
     let shape: Vec<usize> = shape.into();
     proptest::collection::vec((-100i8..=100i8).prop_map(|i| i as f32 / 100f32), len..=len)

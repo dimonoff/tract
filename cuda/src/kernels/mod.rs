@@ -2,30 +2,60 @@
 
 pub mod array;
 mod binary;
-mod launch_args;
+pub mod conv;
+pub mod flash_attn;
+pub mod ggml_flash_attn;
+pub(crate) mod launch_args;
 pub mod matmul;
 pub mod nn;
 mod unary;
-mod utils;
+pub(crate) mod utils;
 
+use std::env;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+use crate::ops::GgmlQuantQ81Fact;
 use crate::tensor::{CudaBuffer, CudaTensor};
 use anyhow::{bail, ensure};
 pub use binary::BinOps;
 use cudarc::driver::{CudaView, CudaViewMut};
-use tract_core::prelude::TractResult;
-use tract_core::tract_linalg::block_quant::{BlockQuant, Q4_0};
+use tract_core::internal::OpaqueFact;
+use tract_core::prelude::{TDim, TractResult};
+use tract_core::tract_linalg::block_quant::{BlockQuant, BlockQuantFact, Q4_0, Q8_1};
 use tract_gpu::tensor::{DeviceTensor, OwnedDeviceTensor};
 use tract_gpu::utils::as_q40_tensor;
 pub use unary::UnaryOps;
 
 const MAX_THREADS: usize = 1024;
+const WARP_SIZE: usize = 32;
 
-const UNARY_OPS: &str = include_str!("ptx/unary.ptx");
-const BINARY_OPS: &str = include_str!("ptx/binary.ptx");
-const ARRAY_OPS: &str = include_str!("ptx/array.ptx");
-const NN_OPS: &str = include_str!("ptx/nn.ptx");
-const GGML_MM_MV: &str = include_str!("ptx/mm_mv.ptx");
-const GGML_MM_MV_Q: &str = include_str!("ptx/mm_mv_q.ptx");
+static CUBIN_FOLDER: OnceLock<PathBuf> = OnceLock::new();
+
+pub fn cubin_dir() -> &'static Path {
+    CUBIN_FOLDER
+        .get_or_init(|| {
+            dirs::cache_dir()
+                .unwrap_or_else(|| ".cache".into())
+                .join("tract")
+                .join(env!("CARGO_PKG_VERSION"))
+                .join("cuda")
+                .join("cubins")
+        })
+        .as_path()
+}
+
+const UNARY_OPS: &str = include_str!("cu/unary.cu");
+const BINARY_OPS: &str = include_str!("cu/binary.cu");
+const ARRAY_OPS: &str = include_str!("cu/array.cu");
+const NN_OPS: &str = include_str!("cu/nn.cu");
+const CNN_OPS: &str = include_str!("cu/cnn.cu");
+const GGML_MM_MV: &str = include_str!("cu/mm_mv.cu");
+const GGML_MM_MV_Q: &str = include_str!("cu/mm_mv_q.cu");
+const GGML_QUANTIZE: &str = include_str!("cu/quantize.cu");
+const GGML_FLASH_ATTN: &str = include_str!("cu/ggml_flash_attn.cu");
+const FLASH_ATTN: &str = include_str!("cu/flash_attn.cu");
+pub const COMMON_H: &str = include_str!("cu/common.cuh");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LibraryName {
@@ -33,20 +63,70 @@ pub enum LibraryName {
     Binary,
     Array,
     NN,
+    Cnn,
     Ggml,
     GgmlQ,
+    Quant,
+    GgmlFlashAttn,
+    FlashAttn,
+}
+
+fn fnv1a64(text: &str) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x00000100000001B3;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for b in text.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }
 
 impl LibraryName {
+    pub const ALL: [LibraryName; 10] = [
+        Self::FlashAttn,
+        Self::GgmlFlashAttn,
+        Self::Unary,
+        Self::Binary,
+        Self::Array,
+        Self::NN,
+        Self::Cnn,
+        Self::Ggml,
+        Self::GgmlQ,
+        Self::Quant,
+    ];
+
     pub fn content(&self) -> &str {
         match self {
             Self::Unary => UNARY_OPS,
             Self::Binary => BINARY_OPS,
             Self::Array => ARRAY_OPS,
             Self::NN => NN_OPS,
+            Self::Cnn => CNN_OPS,
             Self::Ggml => GGML_MM_MV,
             Self::GgmlQ => GGML_MM_MV_Q,
+            Self::Quant => GGML_QUANTIZE,
+            Self::GgmlFlashAttn => GGML_FLASH_ATTN,
+            Self::FlashAttn => FLASH_ATTN,
         }
+    }
+
+    pub fn cubin_path(&self) -> PathBuf {
+        let basename = match self {
+            Self::Unary => "unary",
+            Self::Binary => "binary",
+            Self::Array => "array",
+            Self::NN => "nn",
+            Self::Cnn => "cnn",
+            Self::Ggml => "mm_mv",
+            Self::GgmlQ => "mm_mv_q",
+            Self::Quant => "quantize",
+            Self::GgmlFlashAttn => "flash_attn",
+            Self::FlashAttn => "minimal_flash_attn",
+        };
+        let hash = fnv1a64(self.content());
+        cubin_dir().join(format!("{}_{}.cubin", basename, hash))
     }
 }
 
@@ -105,16 +185,24 @@ impl BroadcastKind {
 }
 
 fn tensor_size(t: &DeviceTensor) -> usize {
-    if let DeviceTensor::Owned(ot) = t {
-        let cuda_tensor =
-            ot.downcast_ref::<CudaTensor>().expect("Non Cuda-Tensor in a Cuda Context");
-
-        if let Some(bqf) = cuda_tensor.block_quant_fact() {
-            return bqf.shape().iter().product::<usize>() * Q4_0.block_bytes() / Q4_0.block_len();
+    let opaque_fact: Option<&dyn OpaqueFact> = match t {
+        DeviceTensor::Owned(ot) => {
+            let cuda_tensor =
+                ot.downcast_ref::<CudaTensor>().expect("Non Cuda-Tensor in a Cuda Context");
+            cuda_tensor.opaque_fact()
         }
-    }
+        DeviceTensor::ArenaView(av) => av.opaque_fact(),
+    };
 
-    t.len() * t.datum_type().size_of()
+    if let Some(of) = opaque_fact {
+        of.buffer_sizes()
+            .iter()
+            .sum::<TDim>()
+            .as_i64()
+            .expect("Symbols should be resolved at this point") as usize
+    } else {
+        t.len() * t.datum_type().size_of()
+    }
 }
 
 pub fn get_cuda_view(t: &DeviceTensor) -> CudaView<'_, u8> {
@@ -146,7 +234,9 @@ pub fn get_sliced_cuda_view_mut(
     len: usize,
 ) -> TractResult<CudaViewMut<'_, u8>> {
     ensure!(offset + len <= t.len() * t.datum_type().size_of());
-    let mut buffer = t.device_buffer().downcast_ref::<CudaBuffer>().unwrap();
+    let buffer: &CudaBuffer = t.device_buffer().downcast_ref::<CudaBuffer>().unwrap();
     let offset = t.buffer_offset::<usize>() + offset;
-    Ok(buffer.as_view_mut().slice_mut(offset..(offset + len)))
+    let ptr: *const CudaBuffer = buffer;
+    let mut_buffer: &mut CudaBuffer = unsafe { (ptr as *mut CudaBuffer).as_mut().unwrap() };
+    Ok(mut_buffer.as_view_mut().slice_mut(offset..(offset + len)))
 }

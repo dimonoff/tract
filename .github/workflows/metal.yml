@@ -18,6 +18,13 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+
+    - run: |
+         . .travis/ci-system-setup.sh
+         echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      env:
+       RUNNER_ENVIRONMENT: ${{ runner.environment }}
+
     - run: cargo check --workspace --exclude test-blas
     - run: cargo test -q -p tract-linalg
     - run: cargo test -q -p tract-core
@@ -46,8 +53,8 @@ jobs:
     runs-on: macOS
     strategy:
       matrix:
-        model: [ OpenELM-270M, OpenELM-1_1B, TinyLlama_v1.1, llama-3.2-3B ]
-        q: [ f16f16, f32f32, q40f16, q40f32, q40ef16, q40ef32 ]
+        model: [ openelm-270M, llama-3.2-1B-instruct, llama-3.2-3B-instruct, llama-3.1-8B-instruct, qwen2.5-7B-instruct, qwen3-1.7B, qwen3-8B ]
+        q: [ f16f16, f32f32, q40ef16]
       fail-fast: false
 
     steps:

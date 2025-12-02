@@ -66,6 +66,9 @@ impl DeviceTensor {
         Self::uninitialized_dt(T::datum_type(), shape)
     }
 
+    pub fn uninitialized_opaque(opaque_fact: Box<dyn OpaqueFact>) -> TractResult<DeviceTensor> {
+        Ok(DeviceTensor::Owned(get_context()?.uninitialized_device_opaque_tensor(opaque_fact)?))
+    }
     // Create a device tensor with a given shape and a slice of elements. The data is copied and aligned to size of T.
     pub fn from_shape<T: Copy + Datum>(shape: &[usize], data: &[T]) -> TractResult<DeviceTensor> {
         Tensor::from_shape(shape, data)?.into_device()
@@ -141,15 +144,6 @@ impl DeviceTensor {
         match self {
             Self::Owned(t) => t.device_buffer().ptr(),
             Self::ArenaView(t) => t.device_buffer().ptr(),
-        }
-    }
-
-    /// Get underlying inner tensor view.
-    #[inline]
-    pub fn view(&self) -> TensorView<'_> {
-        match self {
-            Self::Owned(t) => t.view(),
-            Self::ArenaView(t) => t.view(),
         }
     }
 

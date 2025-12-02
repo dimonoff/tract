@@ -4,10 +4,12 @@ use crate::kernels::{LibraryContent, LibraryName};
 use crate::tensor::{MValue, MetalTensor};
 
 use metal::NSUInteger;
+use tract_core::tract_linalg::block_quant::{BlockQuantFact, BlockQuantValue};
 use tract_gpu::device::{DeviceBuffer, DeviceContext};
 use tract_gpu::tensor::{DeviceTensor, OwnedDeviceTensor};
 use tract_gpu::utils::as_q40_tensor;
 
+use std::alloc::Layout;
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::ops::{Deref, DerefMut};
@@ -175,9 +177,11 @@ impl DeviceContext for MetalContext {
             "Tensor of {:?} is not copied. No device buffer can be allocated for it.",
             view.datum_type(),
         );
-        let data_bytes = as_q40_tensor(view.tensor)
-            .map(|bqv| bqv.value.as_bytes())
-            .unwrap_or(view.tensor.as_bytes());
+        let bqv = as_q40_tensor(view.tensor);
+
+        let (data_bytes, bqf) = bqv
+            .map(|bqv| (bqv.value.as_bytes(), Some(bqv.fact.clone().into())))
+            .unwrap_or((view.tensor.as_bytes(), None));
 
         // Handle empty data
         static ZERO: [u8; 1] = [0];
@@ -192,9 +196,11 @@ impl DeviceContext for MetalContext {
                 None,
             ),
         };
+
         Ok(Box::new(MetalTensor {
             inner: MValue::Natural(tensor.into_arc_tensor()),
             device_buffer,
+            opaque_fact: bqf,
         }))
     }
 
@@ -209,6 +215,26 @@ impl DeviceContext for MetalContext {
             })?
         };
         self.tensor_to_device(tensor.into())
+    }
+
+    fn uninitialized_device_opaque_tensor(
+        &self,
+        opaque_fact: Box<dyn OpaqueFact>,
+    ) -> TractResult<Box<dyn OwnedDeviceTensor>> {
+        if let Some(bqf) = opaque_fact.downcast_ref::<BlockQuantFact>() {
+            let blocks = bqf.shape().iter().product::<usize>() / bqf.format.block_len();
+            let blob = unsafe {
+                Blob::for_layout(
+                    Layout::from_size_align(blocks * bqf.format.block_bytes(), vector_size())
+                        .unwrap(),
+                )
+            };
+            let value = BlockQuantValue { fact: bqf.clone(), value: Arc::new(blob) };
+            let tensor = tensor0(Opaque(Arc::new(value)));
+            self.tensor_to_device(tensor.into())
+        } else {
+            bail!("Only BlockQuant Tensor allocation supported for now")
+        }
     }
 }
 

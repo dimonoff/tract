@@ -7,7 +7,7 @@ use std::fmt;
 use tract_core::internal::*;
 use tract_core::tract_linalg::block_quant::{BlockQuant, Q4_0};
 use tract_gpu::tensor::DeviceTensor;
-use tract_gpu::utils::as_q40_fact;
+use tract_gpu::utils::as_quant_fact;
 
 #[derive(Debug)]
 #[repr(C)]
@@ -142,11 +142,12 @@ impl GemmKernel for GgmlGemm {
 
         let regular_types_support = matches!(
             (facts[0].datum_type, facts[1].datum_type),
-            (F32, F32) | (F16, F16) | (F16, F32)
+            (F32, F32) | (F16, F16) | (F32, F16)
         );
 
         regular_types_support
-            || (as_q40_fact(&facts[1]).is_some() && matches!(facts[0].datum_type, F16 | F32))
+            || (as_quant_fact(&facts[1], &Q4_0).is_some()
+                && matches!(facts[0].datum_type, F16 | F32))
     }
 
     fn output_dt(&self, _a_dt: DatumType, _b_dt: DatumType) -> TractResult<DatumType> {
@@ -388,6 +389,7 @@ mod tests {
             transpose_b: true,
             transpose_c: false,
             quantize_output: None,
+            operating_dt: Some(DatumType::F32),
         };
 
         let mut model = TypedModel::default();

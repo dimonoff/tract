@@ -7,7 +7,9 @@ if [ -z "$RUSTUP_TOOLCHAIN" ]
 then
     export RUSTUP_TOOLCHAIN=1.85.0
 fi
+
 export RUSTUP_TOOLCHAIN
+PATH=$PATH:$HOME/.cargo/bin
 
 if [ -n "$CI" -a ! -e /tmp/ci-setup-done ]
 then
@@ -32,7 +34,6 @@ then
     fi
 
     which rustup || curl https://sh.rustup.rs -sSf | sh -s -- -y
-    PATH=$PATH:$HOME/.cargo/bin
     rustup update
     rustup toolchain add $RUSTUP_TOOLCHAIN
 

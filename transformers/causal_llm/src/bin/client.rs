@@ -1,10 +1,11 @@
 use std::io::Write;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
+use aws_config::BehaviorVersion;
+use aws_sdk_bedrockruntime::primitives::Blob;
 use clap::Parser;
 use reqwest::Client;
 use tokenizers::Tokenizer;
@@ -30,25 +31,113 @@ struct Args {
 
     #[command(subcommand)]
     command: Commands,
-
-    #[structopt(long)]
-    api: Option<Api>,
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 enum Api {
-    Completions,
-    Generate,
+    OpenAICompletions(Client, String),
+    OllamaGenerate(Client, String),
+    AWSBedrockInvokeModel(aws_sdk_bedrockruntime::Client),
 }
 
-impl FromStr for Api {
-    type Err = anyhow::Error;
+struct GenericCompletion {
+    text: String,
+    generated_tokens: usize,
+    prompt_tokens: usize,
+}
 
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s {
-            "completions" => Ok(Api::Completions),
-            "generate" => Ok(Api::Generate),
-            _ => bail!("Unknown api name {s}"),
+impl Api {
+    async fn new(endpoint: &str) -> Api {
+        if endpoint == "awsbedrock" {
+            let config = aws_config::defaults(BehaviorVersion::latest()).load().await;
+            let client = aws_sdk_bedrockruntime::Client::new(&config);
+            Api::AWSBedrockInvokeModel(client)
+        } else if endpoint.ends_with("generate") {
+            Api::OllamaGenerate(Client::new(), endpoint.to_string())
+        } else {
+            Api::OpenAICompletions(Client::new(), endpoint.to_string())
+        }
+    }
+
+    async fn generate(
+        &self,
+        model: &str,
+        prompt: impl Into<String>,
+        max_tokens: usize,
+    ) -> Result<GenericCompletion> {
+        match &self {
+            Api::OpenAICompletions(client, endpoint) => {
+                let query = OpenAICompletionQuery {
+                    prompt: prompt.into(),
+                    model: model.to_string(),
+                    max_tokens,
+                    stop: vec![],
+                };
+                let response = client
+                    .post(endpoint)
+                    .body(serde_json::to_string(&query)?)
+                    .header("content-type", "application/json")
+                    .send()
+                    .await?;
+                if response.status().is_success() {
+                    let it: OpenAICompletionReply = serde_json::from_str(&response.text().await?)?;
+                    Ok(GenericCompletion {
+                        text: it.choices[0].text.clone(),
+                        generated_tokens: it.usage.completion_tokens,
+                        prompt_tokens: it.usage.prompt_tokens,
+                    })
+                } else {
+                    let error = response.text().await.unwrap();
+                    anyhow::bail!(error)
+                }
+            }
+            Api::OllamaGenerate(client, endpoint) => {
+                let query = OllamaCompletionQuery {
+                    prompt: prompt.into(),
+                    model: model.to_string(),
+                    options: OllamaCompletionOptions { num_predict: max_tokens },
+                };
+
+                let response = client
+                    .post(endpoint)
+                    .body(serde_json::to_string(&query)?)
+                    .header("content-type", "application/json")
+                    .send()
+                    .await?;
+
+                if response.status().is_success() {
+                    todo!()
+                    // let it: Oll = serde_json::from_str(response.text().awai?)?;
+                    // Ok(GenericCompletion {
+                    //     text: it.choices[0].text,
+                    //     generated_tokens: it.usage.completion_tokens,
+                    //     prompt_tokens: it.usage.prompt_tokens,
+                    // })
+                } else {
+                    let error = response.text().await.unwrap();
+                    anyhow::bail!(error)
+                }
+            }
+            Api::AWSBedrockInvokeModel(client) => {
+                let stop: [String; 0] = [];
+                let query = serde_json::json!({ "prompt" : prompt.into(), "max_gen_len": max_tokens, "stop":stop}).to_string();
+                let resp = client
+                    .invoke_model()
+                    .model_id(model)
+                    .content_type("application/json")
+                    .accept("application/json")
+                    .body(Blob::new(query.into_bytes()))
+                    .send()
+                    .await?;
+                let raw = String::from_utf8(resp.body.into_inner())?;
+                let v: serde_json::Value = serde_json::from_str(&raw)?;
+                Ok(GenericCompletion {
+                    text: v.get("generation").unwrap().as_str().unwrap().to_string(),
+                    generated_tokens: v.get("generation_token_count").unwrap().as_i64().unwrap()
+                        as usize,
+                    prompt_tokens: v.get("prompt_token_count").unwrap().as_i64().unwrap() as usize,
+                })
+            }
         }
     }
 }
@@ -58,6 +147,8 @@ enum Commands {
     GenerateBench(GenerateBenchArgs),
     Stress(StressArgs),
     Scalability(ScalabilityArgs),
+    Complete(CompleteArgs),
+    Prompts(PromptsArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -75,7 +166,7 @@ impl GenerateBenchArgs {
         for tg in &self.tg {
             print!("\t{tg}");
         }
-        println!("");
+        println!();
         for &pp in &self.pp {
             print!("{pp}");
             for &tg in &self.tg {
@@ -83,7 +174,7 @@ impl GenerateBenchArgs {
                 print!("\t{:.3}", dur.as_secs_f32());
                 let _ = std::io::stdout().flush();
             }
-            println!("");
+            println!();
         }
         Ok(())
     }
@@ -151,8 +242,8 @@ impl StressArgs {
                             as usize)
                             .max(1);
                         if let Ok(it) = clients.run_one_generate(pp, tg).await {
-                            total_pp.fetch_add(it.usage.prompt_tokens, Relaxed);
-                            total_tg.fetch_add(it.usage.completion_tokens, Relaxed);
+                            total_pp.fetch_add(it.prompt_tokens, Relaxed);
+                            total_tg.fetch_add(it.generated_tokens, Relaxed);
                         }
                         if let Some(keepalive) = &keepalive {
                             if keepalive.is_closed() {
@@ -197,7 +288,7 @@ impl ScalabilityArgs {
                     avg_tg: self.avg_tg,
                 };
                 scope.spawn(async move {
-                    let _ = stress.stress(&clients, Some(rx)).await;
+                    let _ = stress.stress(clients, Some(rx)).await;
                 });
                 scope.spawn(async move {
                     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -219,12 +310,49 @@ impl ScalabilityArgs {
     }
 }
 
+#[derive(Parser, Debug)]
+struct CompleteArgs {
+    prompt: String,
+    #[arg(short('n'), default_value = "50")]
+    max_tokens: usize,
+}
+
+impl CompleteArgs {
+    async fn handle(&self, clients: &Clients) -> Result<()> {
+        let reply = clients.complete(&self.prompt, self.max_tokens).await?;
+        println!("{}", reply.text);
+        eprintln!("prompt:{:?} generated:{}", reply.prompt_tokens, reply.generated_tokens);
+        Ok(())
+    }
+}
+
+#[derive(Parser, Debug)]
+struct PromptsArgs {
+    #[arg(short, long, default_value = "50")]
+    len: usize,
+
+    #[arg(short, long, default_value = "50")]
+    count: usize,
+}
+
+impl PromptsArgs {
+    async fn handle(&self, clients: &Clients) -> Result<()> {
+        for _ in 0..self.count {
+            let prompt = clients.get_one_prompt(self.len);
+            println!("{}", prompt.replace("\n", " "));
+        }
+        Ok(())
+    }
+}
+
 impl Commands {
     async fn run(&self, clients: &Clients) -> Result<()> {
         match self {
             Self::GenerateBench(args) => args.handle(clients).await?,
             Self::Stress(args) => args.handle(clients).await?,
             Self::Scalability(args) => args.handle(clients).await?,
+            Self::Complete(args) => args.handle(clients).await?,
+            Self::Prompts(args) => args.handle(clients).await?,
         }
         Ok(())
     }
@@ -232,96 +360,43 @@ impl Commands {
 
 #[derive(Clone, Debug)]
 struct Clients {
-    endpoint: String,
     model: String,
-    client: Client,
     tokens: Vec<u32>,
     tokenizer: Tokenizer,
     api: Api,
 }
 
 impl Clients {
-    fn from_args(args: &Args) -> Self {
+    async fn from_args(args: &Args) -> Self {
         let tokenizer = Tokenizer::from_file(&args.tokenizers).unwrap();
         const BASE_TEXT: &str = include_str!("../lib.rs");
-        let tokens: Vec<u32> = tokenizer.encode_fast(&*BASE_TEXT, true).unwrap().get_ids().into();
-        let api = args.api.unwrap_or(if args.endpoint.ends_with("generate") {
-            Api::Generate
-        } else {
-            Api::Completions
-        });
-        Clients {
-            endpoint: args.endpoint.to_string(),
-            api,
-            model: args.model.clone(),
-            client: Client::new(),
-            tokens,
-            tokenizer,
-        }
+        let tokens: Vec<u32> = tokenizer.encode_fast(BASE_TEXT, true).unwrap().get_ids().into();
+        let api = Api::new(&args.endpoint).await;
+        Clients { api, model: args.model.clone(), tokens, tokenizer }
     }
     fn get_one_prompt(&self, len: usize) -> String {
         assert!(len < self.tokens.len());
         let start: usize = rand::random::<u32>() as usize % (self.tokens.len() - len);
-        self.tokenizer.decode(&self.tokens[start..][..len], true).unwrap()
+        self.tokenizer.decode(&self.tokens[start..][..len.saturating_sub(1)], true).unwrap()
     }
 
-    async fn run_one_generate(&self, pp: usize, tg: usize) -> Result<OpenAICompletionReply> {
-        match self.api {
-            Api::Completions => self.run_one_generate_openai(pp, tg).await,
-            Api::Generate => self.run_one_generate_ollama(pp, tg).await,
-        }
+    async fn run_one_generate(&self, pp: usize, tg: usize) -> Result<GenericCompletion> {
+        self.api.generate(&self.model, &self.get_one_prompt(pp), tg).await
     }
 
-    async fn run_one_generate_ollama(&self, pp: usize, tg: usize) -> Result<OpenAICompletionReply> {
-        let query = OllamaCompletionQuery {
-            prompt: self.get_one_prompt(pp),
-            model: self.model.clone(),
-            options: OllamaCompletionOptions { num_predict: tg },
-        };
-        let response = self
-            .client
-            .post(&self.endpoint)
-            .body(serde_json::to_string(&query)?)
-            .header("content-type", "application/json")
-            .send()
-            .await?;
-        if response.status().is_success() {
-            let it = response.text().await?;
-            Ok(serde_json::from_str(&it)?)
-        } else {
-            let error = response.text().await.unwrap();
-            anyhow::bail!(error)
-        }
-    }
-
-    async fn run_one_generate_openai(&self, pp: usize, tg: usize) -> Result<OpenAICompletionReply> {
-        let query = OpenAICompletionQuery {
-            prompt: self.get_one_prompt(pp),
-            model: self.model.clone(),
-            max_tokens: tg,
-            stop: vec![],
-        };
-        let response = self
-            .client
-            .post(&self.endpoint)
-            .body(serde_json::to_string(&query)?)
-            .header("content-type", "application/json")
-            .send()
-            .await?;
-        if response.status().is_success() {
-            let it = response.text().await?;
-            Ok(serde_json::from_str(&it)?)
-        } else {
-            let error = response.text().await.unwrap();
-            anyhow::bail!(error)
-        }
+    async fn complete(
+        &self,
+        prompt: impl Into<String>,
+        max_tokens: usize,
+    ) -> Result<GenericCompletion> {
+        self.api.generate(&self.model, prompt.into(), max_tokens).await
     }
 
     async fn bench_one_generate(&self, pp: usize, tg: usize) -> Result<Duration> {
         for _attempt in 0..10 {
             let start = Instant::now();
             let it = self.run_one_generate(pp, tg).await?;
-            if it.usage.completion_tokens == tg {
+            if it.generated_tokens == tg {
                 return Ok(start.elapsed());
             };
         }
@@ -332,7 +407,7 @@ impl Clients {
 #[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() -> anyhow::Result<()> {
     let cli = Args::parse();
-    let clients = Clients::from_args(&cli);
+    let clients = Clients::from_args(&cli).await;
 
     let start = Instant::now();
     cli.command.run(&clients).await?;

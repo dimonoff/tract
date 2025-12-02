@@ -1,11 +1,9 @@
 use crate::context::{TractCudaStream, cuda_context};
 use crate::kernels::launch_args::LaunchArgsExt;
-use crate::kernels::{LibraryName, MAX_THREADS, get_cuda_view, utils};
+use crate::kernels::{LibraryName, MAX_THREADS, WARP_SIZE, get_cuda_view, utils};
 use cudarc::driver::{CudaStream, LaunchConfig, PushKernelArg};
 use tract_core::internal::*;
 use tract_gpu::tensor::DeviceTensor;
-
-static WARP_SIZE: u32 = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RmsNorm;
@@ -63,16 +61,12 @@ impl RmsNorm {
         launch_args.arg(&o_view);
         launch_args.set_slice(&shape_nd3);
         launch_args.set_slice(&strides_nd3);
-        if input.datum_type() == DatumType::F32 {
-            launch_args.arg(eps.to_scalar::<f32>()?)
-        } else {
-            launch_args.arg(eps.to_scalar::<f16>()?)
-        };
+        launch_args.arg(eps.to_scalar::<f32>()?);
 
         let cfg = LaunchConfig {
             grid_dim: ((shape_nd3[2] * shape_nd3[0]) as _, 1, 1),
             block_dim: if shape_nd3[1] < MAX_THREADS {
-                (WARP_SIZE, 1, 1)
+                (WARP_SIZE as _, 1, 1)
             } else {
                 (MAX_THREADS as _, 1, 1)
             },
@@ -120,7 +114,7 @@ mod tests {
             )?
             .into_device()?;
 
-            let eps = Arc::new(tensor0(0.0001f32.as_()));
+            let eps = Arc::new(tensor0(0.0001f32));
             let cpu_rms = rms_norm::RmsNorm { axis, eps: Arc::clone(&eps) };
 
             let cpu_output =
@@ -213,7 +207,7 @@ mod tests {
                     let input = (0..shape.iter().product::<usize>())
                         .map(|f| f.as_() / 1000.as_())
                         .collect::<Vec<_>>();
-                    Self { shape, axis, input, eps: Arc::new(tensor0(0.0001f32.as_())) }
+                    Self { shape, axis, input, eps: Arc::new(tensor0(0.0001f32)) }
                 })
                 .boxed()
         }

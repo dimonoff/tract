@@ -87,16 +87,24 @@ impl AxisOp {
     pub fn canonical(&self) -> Cow<'_, AxisOp> {
         match self {
             Move(from, to) if *from == to + 1 => Cow::Owned(Move(*to, *from)),
-            Reshape(at, from, to) if from.len() == 1 && to.len() == 2 && from[0] == to[0] => {
+            Reshape(at, from, to)
+                if from.len() == 1 && to.len() == 2 && from[0] == to[0] && to[1].is_one() =>
+            {
                 Cow::Owned(Add(*at + 1))
             }
-            Reshape(at, from, to) if from.len() == 1 && to.len() == 2 && from[0] == to[1] => {
+            Reshape(at, from, to)
+                if from.len() == 1 && to.len() == 2 && from[0] == to[1] && to[0].is_one() =>
+            {
                 Cow::Owned(Add(*at))
             }
-            Reshape(at, from, to) if from.len() == 2 && to.len() == 1 && from[0] == to[0] => {
+            Reshape(at, from, to)
+                if from.len() == 2 && to.len() == 1 && from[0] == to[0] && from[1].is_one() =>
+            {
                 Cow::Owned(Rm(*at + 1))
             }
-            Reshape(at, from, to) if from.len() == 2 && to.len() == 1 && from[1] == to[0] => {
+            Reshape(at, from, to)
+                if from.len() == 2 && to.len() == 1 && from[1] == to[0] && from[0].is_one() =>
+            {
                 Cow::Owned(Rm(*at))
             }
             other => Cow::Borrowed(other),
@@ -555,12 +563,11 @@ pub fn wire_rank_broadcast(
         inputs.iter().map(|o| target.outlet_fact(*o).cloned()).collect::<TractResult<TVec<_>>>()?;
     let max_rank = facts.iter().map(|f| f.rank()).max().unwrap();
     let mut wires = tvec!();
-    let prefix = prefix.as_ref();
     for i in 0..inputs.len() {
         let mut wire = inputs[i];
-        for j in facts[i].rank()..max_rank {
-            wire =
-                target.wire_node(format!("{prefix}.fix-rank-{i}-{j}"), AxisOp::Add(0), &[wire])?[0];
+        for _ in facts[i].rank()..max_rank {
+            let name = target.unique_name(prefix.as_ref().to_string() + ".fix-rank");
+            wire = target.wire_node(name, AxisOp::Add(0), &[wire])?[0];
         }
         wires.push(wire);
     }

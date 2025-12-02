@@ -16,6 +16,7 @@ pub struct DeviceArenaView {
     pub(crate) shape: TVec<usize>,
     pub(crate) strides: TVec<isize>,
     pub(crate) offset_bytes: usize,
+    pub(crate) opaque_fact: Option<Box<dyn OpaqueFact>>,
 }
 
 impl DeviceArenaView {
@@ -52,6 +53,10 @@ impl DeviceArenaView {
         self.offset_bytes.as_()
     }
 
+    pub fn opaque_fact(&self) -> Option<&dyn OpaqueFact> {
+        self.opaque_fact.as_deref()
+    }
+
     /// Get the number of values in the tensor.
     #[inline]
     #[allow(clippy::len_without_is_empty)]
@@ -59,25 +64,13 @@ impl DeviceArenaView {
         self.len
     }
 
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.arena.as_arc_tensor().unwrap().as_bytes()
-            [self.offset_bytes..self.offset_bytes + self.len() * self.dt.size_of()]
-    }
-
-    #[inline]
-    pub fn view(&self) -> TensorView<'_> {
-        unsafe {
-            TensorView::from_bytes(
-                self.arena.as_arc_tensor().unwrap(),
-                self.offset_bytes as _,
-                self.shape.as_slice(),
-                self.strides.as_slice(),
-            )
-        }
+    pub fn as_bytes(&self) -> Vec<u8> {
+        self.arena.get_bytes_slice(self.offset_bytes, self.len() * self.dt.size_of())
     }
 
     /// Reshaped tensor with given shape.
     pub fn reshaped(&self, shape: impl Into<TVec<usize>>) -> TractResult<Self> {
+        ensure!(self.opaque_fact.is_none(), "Can't reshape opaque tensor");
         let shape = shape.into();
         if self.len() != shape.iter().product::<usize>() {
             bail!("Invalid reshape {:?} to {:?}", self.shape(), shape);
@@ -90,6 +83,7 @@ impl DeviceArenaView {
                 strides: Tensor::natural_strides(&shape),
                 shape,
                 offset_bytes: self.offset_bytes,
+                opaque_fact: None,
             })
         } else {
             Ok(self.clone())
@@ -97,6 +91,7 @@ impl DeviceArenaView {
     }
 
     pub fn restrided(&self, strides: impl Into<TVec<isize>>) -> TractResult<Self> {
+        ensure!(self.opaque_fact.is_none(), "Can't restride opaque tensor");
         let strides = strides.into();
         check_strides_validity(self.shape().into(), strides.clone())?;
 
@@ -108,6 +103,7 @@ impl DeviceArenaView {
                 strides,
                 shape: self.shape.clone(),
                 offset_bytes: self.offset_bytes,
+                opaque_fact: None,
             })
         } else {
             Ok(self.clone())
@@ -126,7 +122,7 @@ impl Display for DeviceArenaView {
 impl IntoTensor for DeviceArenaView {
     fn into_tensor(self) -> Tensor {
         unsafe {
-            Tensor::from_raw_dt(self.dt, &self.shape, self.as_bytes())
+            Tensor::from_raw_dt(self.dt, &self.shape, &self.as_bytes())
                 .expect("Could not transform a DeviceArenaView to tensor")
         }
     }
